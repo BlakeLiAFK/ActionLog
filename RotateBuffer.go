@@ -29,14 +29,12 @@ func NewRotateBuffer() *RotateBuffer {
 }
 
 func (b *RotateBuffer) Write(p []byte) (n int, err error) {
-    var isOverLimit bool
-
     b.mu.Lock()
-    isOverLimit = b.buf.Len()+len(p) > b.MaxSize
-    b.mu.Unlock()
+    defer b.mu.Unlock()
 
-    if isOverLimit {
-        b.rotate()
+    // Check if rotation is needed while holding the lock
+    if b.buf.Len()+len(p) > b.MaxSize {
+        b.rotateUnlocked()
     }
 
     num := atomic.AddInt32(&b.c, 1)
@@ -46,19 +44,23 @@ func (b *RotateBuffer) Write(p []byte) (n int, err error) {
     if b.onWrite != nil {
         b.onWrite(p)
     }
-    b.mu.Lock()
-    defer b.mu.Unlock()
-    // data := append(p, ',')
     return b.buf.Write(p)
 }
 
 func (b *RotateBuffer) rotate() {
     b.mu.Lock()
     defer b.mu.Unlock()
+    b.rotateUnlocked()
+}
+
+func (b *RotateBuffer) rotateUnlocked() {
     if b.onRotate != nil && b.buf.Len() > 0 {
         rBuf := &bytes.Buffer{}
         data := b.buf.Bytes()
-        data = data[:len(data)-2]
+        // Fix: Check length before slicing to avoid panic
+        if len(data) >= 2 {
+            data = data[:len(data)-2]
+        }
         rBuf.Write(data)
         b.wg.Add(1)
         num := int(b.c)

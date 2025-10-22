@@ -13,6 +13,8 @@ type (
         buffer  []T
         buffers [][]T
         opt     *option
+        stopCh  chan struct{}
+        once    sync.Once
     }
     option struct {
         maxBuffers    uint
@@ -34,17 +36,25 @@ func NewBuffer(opts ...Option) *buffer {
         fn(opt)
     }
     buf := &buffer{
-        opt: opt,
+        opt:    opt,
+        stopCh: make(chan struct{}),
     }
     buf.buffer = make([]T, 0, opt.fireThreshold)
     buf.buffers = make([][]T, opt.maxBuffers)
+    // Fix Bug #5: Add stop channel to prevent goroutine leak
     go func() {
+        ticker := time.NewTicker(opt.fireInterval)
+        defer ticker.Stop()
         for {
-            time.Sleep(opt.fireInterval)
-            if buf.Count() == 0 {
-                continue
+            select {
+            case <-ticker.C:
+                if buf.Count() == 0 {
+                    continue
+                }
+                buf.flush()
+            case <-buf.stopCh:
+                return
             }
-            buf.flush()
         }
     }()
     return buf
@@ -87,6 +97,13 @@ func (b *buffer) Drain() {
     b.mutex.Lock()
     defer b.mutex.Unlock()
     b.opt.fn(b.buffer)
+}
+
+// Stop stops the background goroutine
+func (b *buffer) Stop() {
+    b.once.Do(func() {
+        close(b.stopCh)
+    })
 }
 
 func WithHandler(fn func([]T)) Option {
