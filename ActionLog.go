@@ -1,7 +1,6 @@
 package ActionLog
 
 import (
-    "bytes"
     "context"
     "io"
     "os"
@@ -21,8 +20,11 @@ type (
         closed         bool
         closeCh        chan struct{}
         closeOnce      sync.Once
+        activeOps      sync.WaitGroup  // Fix #9: Track active operations
     }
     F            map[string]interface{}
+    // ErrorHandler is called when an error occurs during logging.
+    // Fix #16: Document that handler must be thread-safe.
     ErrorHandler func(error)
 )
 
@@ -41,11 +43,12 @@ func New(fields ...F) *ActionLog {
     L.pool.New = func() interface{} {
         return &Entry{
             Data:   make(F),
-            Buffer: &bytes.Buffer{},
+            // Fix #17: Remove unused Buffer field
         }
     }
     return L
 }
+
 func (a *ActionLog) SetWriter(w io.Writer) {
     a.mutex.Lock()
     defer a.mutex.Unlock()
@@ -65,7 +68,9 @@ func (a *ActionLog) Info(fields F, args ...interface{}) {
         a.mutex.RUnlock()
         return
     }
+    a.activeOps.Add(1)  // Fix #9: Track operation
     a.mutex.RUnlock()
+    defer a.activeOps.Done()
 
     entry := a.allocEntry()
     entry.WithTime(time.Now()).WithFields(a.standardFields).WithFields(fields).Info(args...)
@@ -74,7 +79,7 @@ func (a *ActionLog) Info(fields F, args ...interface{}) {
     a.freeEntry(entry)
 }
 
-// InfoContext logs with context support (Defect #10)
+// InfoContext logs with context support
 func (a *ActionLog) InfoContext(ctx context.Context, fields F, args ...interface{}) {
     if ctx.Err() != nil {
         return
@@ -85,7 +90,9 @@ func (a *ActionLog) InfoContext(ctx context.Context, fields F, args ...interface
         a.mutex.RUnlock()
         return
     }
+    a.activeOps.Add(1)  // Fix #9: Track operation
     a.mutex.RUnlock()
+    defer a.activeOps.Done()
 
     entry := a.allocEntry()
     entry.WithTime(time.Now()).WithFields(a.standardFields).WithFields(fields).Info(args...)
@@ -99,23 +106,27 @@ func (a *ActionLog) InfoContext(ctx context.Context, fields F, args ...interface
     a.write(entry)
     a.freeEntry(entry)
 }
+
 func (a *ActionLog) allocEntry() *Entry {
     entry := a.pool.Get().(*Entry)
     return entry
 }
 
 func (a *ActionLog) freeEntry(entry *Entry) {
-    entry.Data = map[string]interface{}{}
-    entry.Buffer.Reset()
+    // Fix #1: Clear map instead of reallocating
+    for k := range entry.Data {
+        delete(entry.Data, k)
+    }
     a.pool.Put(entry)
 }
+
 func (a *ActionLog) fire(entry *Entry) {
     a.mutex.RLock()
     defer a.mutex.RUnlock()
     if len(a.hooks) == 0 {
         return
     }
-    // Fix Defect #6: Continue executing hooks even if one fails
+    // Continue executing hooks even if one fails
     for _, hook := range a.hooks {
         err := hook.Fire(entry)
         if err != nil && a.errorHandler != nil {
@@ -123,6 +134,7 @@ func (a *ActionLog) fire(entry *Entry) {
         }
     }
 }
+
 func (a *ActionLog) AddHook(hook Hook) {
     if hook == nil {
         return
@@ -135,7 +147,7 @@ func (a *ActionLog) AddHook(hook Hook) {
 func (a *ActionLog) write(entry *Entry) {
     a.mutex.Lock()
     defer a.mutex.Unlock()
-    // Fix Defect #7: Report errors instead of silently ignoring them
+    // Report errors instead of silently ignoring them
     data, err := a.formatter.Format(entry)
     if err != nil {
         if a.errorHandler != nil {
@@ -151,7 +163,8 @@ func (a *ActionLog) write(entry *Entry) {
     }
 }
 
-// Shutdown gracefully shuts down the logger (Defect #11)
+// Shutdown gracefully shuts down the logger
+// Fix #9: Wait for all active operations to complete
 func (a *ActionLog) Shutdown(ctx context.Context) error {
     a.closeOnce.Do(func() {
         a.mutex.Lock()
@@ -160,14 +173,34 @@ func (a *ActionLog) Shutdown(ctx context.Context) error {
         close(a.closeCh)
     })
 
+    // Wait for all active operations to complete
+    done := make(chan struct{})
+    go func() {
+        a.activeOps.Wait()
+        close(done)
+    }()
+
     select {
     case <-ctx.Done():
         return ctx.Err()
-    case <-time.After(100 * time.Millisecond):
+    case <-done:
         return nil
     }
 }
 
+// Fix #14: Add lock protection
 func (a *ActionLog) Formatter() Formatter {
+    a.mutex.RLock()
+    defer a.mutex.RUnlock()
     return a.formatter
+}
+
+// Fix #15: Add SetFormatter method
+func (a *ActionLog) SetFormatter(f Formatter) {
+    if f == nil {
+        return
+    }
+    a.mutex.Lock()
+    defer a.mutex.Unlock()
+    a.formatter = f
 }

@@ -9,14 +9,15 @@ import (
 
 type (
     RotateBuffer struct {
-        mu       sync.Mutex
-        buf      *bytes.Buffer
-        MaxSize  int
-        onRotate func(buffer []byte, t0, t1 time.Time, num int)
-        onWrite  func([]byte)
-        t0       time.Time
-        c        int32
-        wg       *sync.WaitGroup
+        mu         sync.Mutex
+        buf        *bytes.Buffer
+        MaxSize    int
+        callbackMu sync.RWMutex  // Fix #13: Protect callbacks
+        onRotate   func(buffer []byte, t0, t1 time.Time, num int)
+        onWrite    func([]byte)
+        t0         time.Time
+        c          int32
+        wg         *sync.WaitGroup
     }
 )
 
@@ -41,8 +42,14 @@ func (b *RotateBuffer) Write(p []byte) (n int, err error) {
     if num == 1 {
         b.t0 = time.Now()
     }
-    if b.onWrite != nil {
-        b.onWrite(p)
+
+    // Fix #13: Read callback with RLock
+    b.callbackMu.RLock()
+    onWrite := b.onWrite
+    b.callbackMu.RUnlock()
+
+    if onWrite != nil {
+        onWrite(p)
     }
     return b.buf.Write(p)
 }
@@ -54,24 +61,32 @@ func (b *RotateBuffer) rotate() {
 }
 
 func (b *RotateBuffer) rotateUnlocked() {
-    if b.onRotate != nil && b.buf.Len() > 0 {
-        rBuf := &bytes.Buffer{}
-        data := b.buf.Bytes()
-        // Fix: Check length before slicing to avoid panic
-        if len(data) >= 2 {
-            data = data[:len(data)-2]
+    if b.buf.Len() > 0 {
+        // Fix #13: Read callback with RLock
+        b.callbackMu.RLock()
+        onRotate := b.onRotate
+        b.callbackMu.RUnlock()
+
+        if onRotate != nil {
+            rBuf := &bytes.Buffer{}
+            data := b.buf.Bytes()
+            // Fix: Check length before slicing to avoid panic
+            if len(data) >= 2 {
+                data = data[:len(data)-2]
+            }
+            rBuf.Write(data)
+            b.wg.Add(1)
+            num := int(b.c)
+            t0 := b.t0
+            t1 := time.Now()
+            go func() {
+                defer b.wg.Done()
+                onRotate(rBuf.Bytes(), t0, t1, num)
+            }()
         }
-        rBuf.Write(data)
-        b.wg.Add(1)
-        num := int(b.c)
-        t0 := b.t0
-        t1 := time.Now()
-        go func() {
-            defer b.wg.Done()
-            b.onRotate(rBuf.Bytes(), t0, t1, num)
-        }()
     }
-    b.buf = &bytes.Buffer{}
+    // Fix #5: Use Reset instead of reallocating
+    b.buf.Reset()
     atomic.StoreInt32(&b.c, 0)
 }
 
@@ -82,17 +97,26 @@ func (b *RotateBuffer) Close() {
     b.rotate()
     b.wg.Wait()
 }
+
+// Fix #6: Optimize Current() to avoid double copy
 func (b *RotateBuffer) Current() []byte {
     b.mu.Lock()
     defer b.mu.Unlock()
-    buf := &bytes.Buffer{}
-    buf.Write(b.buf.Bytes())
-    return buf.Bytes()
+    data := make([]byte, b.buf.Len())
+    copy(data, b.buf.Bytes())
+    return data
 }
 
+// Fix #13: Add lock protection
 func (b *RotateBuffer) OnRotate(fn func(buffer []byte, t0, t1 time.Time, num int)) {
+    b.callbackMu.Lock()
+    defer b.callbackMu.Unlock()
     b.onRotate = fn
 }
+
+// Fix #13: Add lock protection
 func (b *RotateBuffer) OnWrite(fn func([]byte)) {
+    b.callbackMu.Lock()
+    defer b.callbackMu.Unlock()
     b.onWrite = fn
 }

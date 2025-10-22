@@ -61,28 +61,34 @@ func NewBuffer(opts ...Option) *buffer {
 }
 func (b *buffer) Add(s T) {
     b.mutex.Lock()
-    defer b.mutex.Unlock()
     b.buffer = append(b.buffer, s)
+    var oldBuffer []T
     if len(b.buffer) >= b.opt.fireThreshold {
-        oldBuffer := b.buffer
+        oldBuffer = b.buffer
         b.buffer = b.buffers[0]
         b.buffers = b.buffers[1:]
         if len(b.buffers) == 0 {
             b.buffers = make([][]T, b.opt.maxBuffers)
         }
+    }
+    b.mutex.Unlock()
+
+    // Fix #12: Call handler outside lock to prevent blocking
+    if oldBuffer != nil {
         b.opt.fn(oldBuffer)
     }
 }
 func (b *buffer) flush() {
     b.mutex.Lock()
-    defer b.mutex.Unlock()
-
     oldBuffer := b.buffer
     b.buffer = b.buffers[0]
     b.buffers = b.buffers[1:]
     if len(b.buffers) == 0 {
         b.buffers = make([][]T, b.opt.maxBuffers)
     }
+    b.mutex.Unlock()
+
+    // Fix #12: Call handler outside lock to prevent blocking
     b.opt.fn(oldBuffer)
 }
 func (b *buffer) Count() int {
@@ -90,13 +96,18 @@ func (b *buffer) Count() int {
     defer b.mutex.RUnlock()
     return len(b.buffer)
 }
+// Drain flushes any remaining buffered items and clears the buffer
 func (b *buffer) Drain() {
-    if b.Count() == 0 {
-        return
-    }
     b.mutex.Lock()
     defer b.mutex.Unlock()
+
+    if len(b.buffer) == 0 {
+        return
+    }
+
+    // Call handler and clear buffer to prevent duplicate sends
     b.opt.fn(b.buffer)
+    b.buffer = b.buffer[:0]  // Clear but retain capacity
 }
 
 // Stop stops the background goroutine

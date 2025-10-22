@@ -3,7 +3,18 @@ package ActionLog
 import (
     "bytes"
     jsoniter "github.com/json-iterator/go"
+    "sync"
 )
+
+// Fix #4: Use package-level json config
+var jsonConfig = jsoniter.ConfigCompatibleWithStandardLibrary
+
+// Fix #3: Pool for temporary maps
+var formatterMapPool = sync.Pool{
+    New: func() interface{} {
+        return make(F, 16)
+    },
+}
 
 type (
     Formatter interface {
@@ -20,7 +31,17 @@ func (d *defaultFormatter) SetPrefix(s string) {
 }
 
 func (d defaultFormatter) Format(entry *Entry) ([]byte, error) {
-    data := make(F, len(entry.Data)+2)
+    // Fix #3: Use pooled map
+    data := formatterMapPool.Get().(F)
+    defer func() {
+        // Clear and return to pool
+        for k := range data {
+            delete(data, k)
+        }
+        formatterMapPool.Put(data)
+    }()
+
+    // Copy entry data
     for k, v := range entry.Data {
         data[k] = v
     }
@@ -28,8 +49,9 @@ func (d defaultFormatter) Format(entry *Entry) ([]byte, error) {
     if entry.Message != "" {
         data["msg"] = entry.Message
     }
-    var json = jsoniter.ConfigCompatibleWithStandardLibrary
-    bin, err := json.Marshal(&data)
+
+    // Fix #4: Use package-level jsonConfig
+    bin, err := jsonConfig.Marshal(&data)
     if err != nil {
         return nil, err
     }

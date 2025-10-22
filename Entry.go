@@ -1,7 +1,6 @@
 package ActionLog
 
 import (
-    "bytes"
     "fmt"
     "time"
 )
@@ -11,7 +10,7 @@ type (
         Data    F
         Time    time.Time
         Message string
-        Buffer  *bytes.Buffer
+        // Fix #17: Removed unused Buffer field
     }
 )
 
