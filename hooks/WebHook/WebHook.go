@@ -53,6 +53,8 @@ func (h *webHook) Fire(entry *ActionLog.Entry) error {
     if !fn(entry) {
         return nil
     }
+
+    // Note: Cannot pool this map as buffer holds reference until async handler completes
     data := make(ActionLog.F, len(entry.Data)+2)
     for k, v := range entry.Data {
         data[k] = v

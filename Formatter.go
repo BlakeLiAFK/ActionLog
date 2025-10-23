@@ -1,7 +1,6 @@
 package ActionLog
 
 import (
-    "bytes"
     jsoniter "github.com/json-iterator/go"
     "sync"
 )
@@ -55,12 +54,16 @@ func (d defaultFormatter) Format(entry *Entry) ([]byte, error) {
     if err != nil {
         return nil, err
     }
+
+    // Optimize: Avoid buffer allocation when possible
     if d.prefix == nil {
         return append(bin, '\n'), nil
-    } else {
-        buf := bytes.NewBuffer(d.prefix)
-        buf.Write(bin)
-        buf.WriteString("\n")
-        return buf.Bytes(), nil
     }
+
+    // With prefix: preallocate correct size
+    result := make([]byte, 0, len(d.prefix)+len(bin)+1)
+    result = append(result, d.prefix...)
+    result = append(result, bin...)
+    result = append(result, '\n')
+    return result, nil
 }

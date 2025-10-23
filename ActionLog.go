@@ -235,20 +235,25 @@ func (a *ActionLog) AddHook(hook Hook) {
 }
 
 func (a *ActionLog) write(entry *Entry) {
-    a.mutex.Lock()
-    defer a.mutex.Unlock()
+    // CRITICAL FIX: Use RLock instead of Lock - we only read formatter/writer
+    a.mutex.RLock()
+    formatter := a.formatter
+    writer := a.writer
+    errorHandler := a.errorHandler
+    a.mutex.RUnlock()
+
     // Report errors instead of silently ignoring them
-    data, err := a.formatter.Format(entry)
+    data, err := formatter.Format(entry)
     if err != nil {
-        if a.errorHandler != nil {
-            a.errorHandler(err)
+        if errorHandler != nil {
+            errorHandler(err)
         }
         return
     }
-    _, err = a.writer.Write(data)
+    _, err = writer.Write(data)
     if err != nil {
-        if a.errorHandler != nil {
-            a.errorHandler(err)
+        if errorHandler != nil {
+            errorHandler(err)
         }
     }
 }
