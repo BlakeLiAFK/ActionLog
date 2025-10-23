@@ -1,3 +1,5 @@
+// Package ActionLog provides a flexible and concurrent-safe logging framework
+// with support for structured logging, hooks, and context propagation.
 package ActionLog
 
 import (
@@ -9,6 +11,16 @@ import (
 )
 
 type (
+    // ActionLog is the main logger instance. It is safe for concurrent use.
+    // Use New() to create an instance with optional standard fields that will
+    // be included in all log entries.
+    //
+    // Example:
+    //     logger := ActionLog.New(ActionLog.F{"service": "api", "version": "1.0"})
+    //     logger.Info(ActionLog.F{"user": "john"}, "User logged in")
+    //
+    // The logger supports graceful shutdown via Shutdown() which waits for
+    // all in-flight log operations to complete.
     ActionLog struct {
         mutex          sync.RWMutex
         pool           sync.Pool
@@ -22,12 +34,38 @@ type (
         closeOnce      sync.Once
         activeOps      sync.WaitGroup  // Fix #9: Track active operations
     }
+    // F represents structured log fields as key-value pairs.
+    // It is a convenience type for map[string]interface{}.
+    //
+    // Example:
+    //     fields := ActionLog.F{"user_id": 123, "action": "login", "success": true}
     F            map[string]interface{}
-    // ErrorHandler is called when an error occurs during logging.
-    // Fix #16: Document that handler must be thread-safe.
+
+    // ErrorHandler is called when an error occurs during logging operations
+    // (e.g., write failures, hook failures, or formatting errors).
+    //
+    // IMPORTANT: The handler MUST be thread-safe as it may be called concurrently
+    // from multiple goroutines. The handler should not block for extended periods
+    // as it may impact logging performance.
+    //
+    // Example:
+    //     logger.SetErrorHandler(func(err error) {
+    //         fmt.Fprintf(os.Stderr, "Logging error: %v\n", err)
+    //     })
     ErrorHandler func(error)
 )
 
+// New creates a new ActionLog instance with optional standard fields.
+// Standard fields will be included in every log entry.
+//
+// Parameters:
+//   - fields: Optional standard fields to include in all log entries
+//
+// Returns a configured logger that writes to os.Stdout by default.
+// Use SetWriter() to change the output destination.
+//
+// Example:
+//     logger := ActionLog.New(ActionLog.F{"service": "api", "env": "prod"})
 func New(fields ...F) *ActionLog {
     L := &ActionLog{
         writer:         os.Stdout,
@@ -62,6 +100,22 @@ func (a *ActionLog) SetErrorHandler(handler ErrorHandler) {
     a.errorHandler = handler
 }
 
+// Info logs a message with structured fields at INFO level.
+// This is the primary logging method for general informational messages.
+//
+// Parameters:
+//   - fields: Structured key-value pairs to include in this log entry
+//   - args: Message components that will be concatenated (similar to fmt.Sprint)
+//
+// The log entry will include standard fields (set via New), the provided fields,
+// a timestamp, and the message. All registered hooks will be invoked.
+//
+// Example:
+//     logger.Info(ActionLog.F{"user_id": 123}, "User login successful")
+//     logger.Info(ActionLog.F{"count": 42}, "Processed ", 42, " items")
+//
+// Note: This method is thread-safe and non-blocking. For context-aware logging
+// with distributed tracing support, use InfoContext() instead.
 func (a *ActionLog) Info(fields F, args ...interface{}) {
     a.mutex.RLock()
     if a.closed {
@@ -69,17 +123,39 @@ func (a *ActionLog) Info(fields F, args ...interface{}) {
         return
     }
     a.activeOps.Add(1)  // Fix #9: Track operation
+    // Fix #10: Allocate entry while holding lock to prevent race
+    entry := a.allocEntryLocked()
     a.mutex.RUnlock()
     defer a.activeOps.Done()
 
-    entry := a.allocEntry()
-    entry.WithTime(time.Now()).WithFields(a.standardFields).WithFields(fields).Info(args...)
+    // standardFields already copied in allocEntryLocked()
+    entry.WithTime(time.Now()).WithFields(fields).Info(args...)
     a.fire(entry)
     a.write(entry)
     a.freeEntry(entry)
 }
 
-// InfoContext logs with context support
+// InfoContext logs a message with context support for distributed tracing.
+// This method is preferred over Info() when working with context-based systems.
+//
+// Parameters:
+//   - ctx: Context for cancellation and trace propagation
+//   - fields: Structured key-value pairs to include in this log entry
+//   - args: Message components that will be concatenated
+//
+// The method will:
+//   1. Return immediately if the context is cancelled
+//   2. Extract trace_id from context if present and include it in the log
+//   3. Respect context deadlines and cancellation
+//
+// Example:
+//     ctx := context.WithValue(r.Context(), "trace_id", "abc-123")
+//     logger.InfoContext(ctx, ActionLog.F{"endpoint": "/api/users"}, "Request processed")
+//
+// Use Cases:
+//   - HTTP request handlers: propagate request context for tracing
+//   - Background jobs: respect cancellation signals
+//   - Microservices: correlate logs across service boundaries
 func (a *ActionLog) InfoContext(ctx context.Context, fields F, args ...interface{}) {
     if ctx.Err() != nil {
         return
@@ -91,11 +167,13 @@ func (a *ActionLog) InfoContext(ctx context.Context, fields F, args ...interface
         return
     }
     a.activeOps.Add(1)  // Fix #9: Track operation
+    // Fix #10: Allocate entry while holding lock to prevent race
+    entry := a.allocEntryLocked()
     a.mutex.RUnlock()
     defer a.activeOps.Done()
 
-    entry := a.allocEntry()
-    entry.WithTime(time.Now()).WithFields(a.standardFields).WithFields(fields).Info(args...)
+    // standardFields already copied in allocEntryLocked()
+    entry.WithTime(time.Now()).WithFields(fields).Info(args...)
 
     // Add trace ID if present in context
     if trace := ctx.Value("trace_id"); trace != nil {
@@ -108,7 +186,19 @@ func (a *ActionLog) InfoContext(ctx context.Context, fields F, args ...interface
 }
 
 func (a *ActionLog) allocEntry() *Entry {
+    a.mutex.RLock()
+    defer a.mutex.RUnlock()
+    return a.allocEntryLocked()
+}
+
+// allocEntryLocked allocates entry with caller holding read lock
+// Fix #10: Prevents race between closed check and entry allocation
+func (a *ActionLog) allocEntryLocked() *Entry {
     entry := a.pool.Get().(*Entry)
+    // Fix #2: Pre-copy standardFields to avoid WithFields overhead
+    for k, v := range a.standardFields {
+        entry.Data[k] = v
+    }
     return entry
 }
 
