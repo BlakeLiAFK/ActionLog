@@ -23,6 +23,7 @@ type (
     // all in-flight log operations to complete.
     ActionLog struct {
         mutex          sync.RWMutex
+        writeMutex     sync.Mutex       // Protects writer.Write() calls
         pool           sync.Pool
         standardFields F
         hooks          []Hook
@@ -235,21 +236,36 @@ func (a *ActionLog) AddHook(hook Hook) {
 }
 
 func (a *ActionLog) write(entry *Entry) {
-    // CRITICAL FIX: Use RLock instead of Lock - we only read formatter/writer
+    // PERFORMANCE FIX: Separate read lock for formatter and write lock for writer
+    // This allows concurrent formatting while serializing writes
+
+    // 1. Get formatter with read lock (allows concurrent formatting)
     a.mutex.RLock()
     formatter := a.formatter
-    writer := a.writer
-    errorHandler := a.errorHandler
     a.mutex.RUnlock()
 
-    // Report errors instead of silently ignoring them
+    // 2. Format outside lock - multiple goroutines can format concurrently
     data, err := formatter.Format(entry)
     if err != nil {
+        a.mutex.RLock()
+        errorHandler := a.errorHandler
+        a.mutex.RUnlock()
         if errorHandler != nil {
             errorHandler(err)
         }
         return
     }
+
+    // 3. Write with dedicated mutex - writer.Write() may not be thread-safe
+    // This serializes writes but allows formatting to remain concurrent
+    a.writeMutex.Lock()
+    defer a.writeMutex.Unlock()
+
+    a.mutex.RLock()
+    writer := a.writer
+    errorHandler := a.errorHandler
+    a.mutex.RUnlock()
+
     _, err = writer.Write(data)
     if err != nil {
         if errorHandler != nil {
